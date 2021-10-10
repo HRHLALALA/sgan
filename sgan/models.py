@@ -30,7 +30,7 @@ class Encoder(nn.Module):
     TrajectoryDiscriminator"""
     def __init__(
         self, embedding_dim=64, h_dim=64, mlp_dim=1024, num_layers=1,
-        dropout=0.0
+        dropout=0.0, return_all=False
     ):
         super(Encoder, self).__init__()
 
@@ -44,6 +44,7 @@ class Encoder(nn.Module):
         )
 
         self.spatial_embedding = nn.Linear(2, embedding_dim)
+        self.return_all=return_all
 
     def init_hidden(self, batch):
         return (
@@ -60,13 +61,15 @@ class Encoder(nn.Module):
         """
         # Encode observed Trajectory
         batch = obs_traj.size(1)
-        obs_traj_embedding = self.spatial_embedding(obs_traj.view(-1, 2))
+        obs_traj_embedding = self.spatial_embedding(obs_traj.contiguous().view(-1, 2))
         obs_traj_embedding = obs_traj_embedding.view(
             -1, batch, self.embedding_dim
         )
         state_tuple = self.init_hidden(batch)
         output, state = self.encoder(obs_traj_embedding, state_tuple)
         final_h = state[0]
+        if self.return_all:
+            return output
         return final_h
 
 
@@ -609,3 +612,73 @@ class TrajectoryDiscriminator(nn.Module):
             )
         scores = self.real_classifier(classifier_input)
         return scores
+
+class PatchedTrajectoryDiscriminator(nn.Module):
+    def __init__(
+        self, obs_len, pred_len, embedding_dim=64, h_dim=64, mlp_dim=1024,
+        num_layers=1, activation='relu', batch_norm=True, dropout=0.0,
+        d_type='local'
+    ):
+        super(PatchedTrajectoryDiscriminator, self).__init__()
+
+        self.obs_len = obs_len
+        self.pred_len = pred_len
+        self.seq_len = obs_len + pred_len
+        self.mlp_dim = mlp_dim
+        self.h_dim = h_dim
+        self.d_type = d_type
+
+        self.encoder = Encoder(
+            embedding_dim=embedding_dim,
+            h_dim=h_dim,
+            mlp_dim=mlp_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            return_all=True
+        )
+
+        real_classifier_dims = [h_dim, mlp_dim, 1]
+        self.real_classifier = make_mlp(
+            real_classifier_dims,
+            activation=activation,
+            batch_norm=batch_norm,
+            dropout=dropout
+        )
+        if d_type == 'global':
+            mlp_pool_dims = [h_dim + embedding_dim, mlp_dim, h_dim]
+            self.pool_net = PoolHiddenNet(
+                embedding_dim=embedding_dim,
+                h_dim=h_dim,
+                mlp_dim=mlp_pool_dims,
+                bottleneck_dim=h_dim,
+                activation=activation,
+                batch_norm=batch_norm
+            )
+
+    def forward(self, traj, traj_rel, seq_start_end=None):
+        """
+        Inputs:
+        - traj: Tensor of shape (obs_len + pred_len, batch, 2)
+        - traj_rel: Tensor of shape (obs_len + pred_len, batch, 2)
+        - seq_start_end: A list of tuples which delimit sequences within batch
+        Output:
+        - scores: Tensor of shape (batch,) with real/fake scores
+        """
+        outputs = self.encoder(traj_rel)
+        # Note: In case of 'global' option we are using start_pos as opposed to
+        # end_pos. The intution being that hidden state has the whole
+        # trajectory and relative postion at the start when combined with
+        # trajectory information should help in discriminative behavior.
+
+        if self.d_type == 'local':
+            classifier_input = outputs.squeeze()
+        else:
+            classifier_inputs = []
+            for output in outputs:
+                classifier_input = self.pool_net(
+                    output.squeeze(), seq_start_end, traj[0]
+                )
+            classifier_inputs.append(output)
+            classifier_input = torch.stack(classifier_inputs)
+        scores = self.real_classifier(classifier_input)
+        return scores[-self.pred_len:]

@@ -2,17 +2,18 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 RUN_NAME=$1
 DATASET_NAME=${2:-univ}
 echo "Run name: ${RUN_NAME} on Dataset: ${DATASET_NAME}"
-DTYPE=global
+DTYPE=local
 
 if [ -p RUN_NAME ]; then
   OUTPUT_DIR=$PWD/checkpoints/${DATASET_NAME}
 else
   OUTPUT_DIR=$PWD/checkpoints/${DATASET_NAME}/$RUN_NAME
 fi
+echo $OUTPUT_DIR
 mkdir -p $OUTPUT_DIR
-python scripts/train.py \
+python scripts/train_multi_gen.py \
   --output_dir $OUTPUT_DIR \
-  --encoder_h_dim_d 48 \
+  --encoder_h_dim_d 32 \
   --neighborhood_size 2.0 \
   --clipping_threshold_d 0 \
   --clipping_threshold_g 2.0 \

@@ -2,6 +2,7 @@ import argparse
 import gc
 import logging
 import os
+import random
 import sys
 import time
 
@@ -9,16 +10,19 @@ from collections import defaultdict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 from sgan.data.loader import data_loader
 from sgan.losses import gan_g_loss, gan_d_loss, l2_loss
 from sgan.losses import displacement_error, final_displacement_error
 
-from sgan.models import TrajectoryGenerator, TrajectoryDiscriminator
+from sgan.models import MultiTrajectoryGenerator as  TrajectoryGenerator
+from sgan.models import MultiGenDiscriminator as TrajectoryDiscriminator
 from sgan.utils import int_tuple, bool_flag, get_total_norm
 from sgan.utils import relative_to_abs, get_dset_path
-
+from torch.utils.tensorboard import SummaryWriter
+writer = SummaryWriter()
 torch.backends.cudnn.benchmark = True
 
 parser = argparse.ArgumentParser()
@@ -131,6 +135,7 @@ def main(args):
     generator = TrajectoryGenerator(
         obs_len=args.obs_len,
         pred_len=args.pred_len,
+        n_gens = args.best_k,
         embedding_dim=args.embedding_dim,
         encoder_h_dim=args.encoder_h_dim_g,
         decoder_h_dim=args.decoder_h_dim_g,
@@ -145,6 +150,7 @@ def main(args):
         bottleneck_dim=args.bottleneck_dim,
         neighborhood_size=args.neighborhood_size,
         grid_size=args.grid_size,
+        activation='leakyrelu',
         batch_norm=args.batch_norm)
 
     generator.apply(init_weights)
@@ -161,7 +167,10 @@ def main(args):
         num_layers=args.num_layers,
         dropout=args.dropout,
         batch_norm=args.batch_norm,
-        d_type=args.d_type)
+        d_type=args.d_type,
+        # encoder = generator.encoder,
+        activation = "leakyrelu"
+    )
 
     discriminator.apply(init_weights)
     discriminator.type(float_dtype).train()
@@ -172,14 +181,13 @@ def main(args):
     d_loss_fn = gan_d_loss
 
     optimizer_g = optim.Adam(generator.parameters(), lr=args.g_learning_rate)
-    optimizer_d = optim.Adam(
-        {
-            discriminator.parameters(): 0.001,
-
-        }, lr=args.d_learning_rate
-    )
-    discriminator.encoder = generator.encoder
-    logger.info(discriminator)
+    optimizer_d = optim.Adam(discriminator.parameters(), lr=args.d_learning_rate)
+    # optimizer_d = optim.Adam(
+    #     [   {'params': discriminator.real_classifier.parameters()},
+    #         {'params': discriminator.gen_id_predictor.parameters()}
+    #
+    #     ], lr=args.d_learning_rate
+    # )
 
     # Maybe restore from checkpoint
     restore_path = None
@@ -248,6 +256,14 @@ def main(args):
                 losses_d = discriminator_step(args, batch, generator,
                                               discriminator, d_loss_fn,
                                               optimizer_d)
+                writer.add_scalars(
+                    'gan',{
+                       'D_data_loss': losses_d['D_data_loss']
+                    },t
+                )
+                writer.add_scalar(
+                    'cls_loss', losses_d['D_data_loss'], t
+                )
                 checkpoint['norm_d'].append(
                     get_total_norm(discriminator.parameters()))
                 d_steps_left -= 1
@@ -255,7 +271,19 @@ def main(args):
                 step_type = 'g'
                 losses_g = generator_step(args, batch, generator,
                                           discriminator, g_loss_fn,
-                                          optimizer_g)
+                                          optimizer_g, t)
+                # writer.add_scalar('gen', losses_g, t)
+                writer.add_scalars(
+                    'gan', {
+                        'G_data_loss':losses_g['G_data_loss']}, t
+                )
+                writer.add_scalar(
+                    'l2_loss', losses_g['G_l2_loss_rel'], t
+                )
+
+                writer.add_scalar(
+                    'cls_loss', losses_g['G_cls_loss'], t
+                )
                 checkpoint['norm_g'].append(
                     get_total_norm(generator.parameters())
                 )
@@ -365,7 +393,7 @@ def main(args):
 
 
 def discriminator_step(
-    args, batch, generator, discriminator, d_loss_fn, optimizer_d,num_iter
+    args, batch, generator, discriminator, d_loss_fn, optimizer_d
 ):
     batch = [tensor.cuda() for tensor in batch]
     (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped,
@@ -375,7 +403,9 @@ def discriminator_step(
 
     generator_out = generator(obs_traj, obs_traj_rel, seq_start_end)
 
-    pred_traj_fake_rel = generator_out
+    idxes = torch.randint(0, args.best_k, (generator_out.size(2),)).cuda()
+    # idx_onehot = F.one_hot(idxes, args.best_k)
+    pred_traj_fake_rel = generator_out.permute(2,1,0,3)[torch.arange(generator_out.size(2)), idxes].permute(1,0,2)
     pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1])
 
     traj_real = torch.cat([obs_traj, pred_traj_gt], dim=0)
@@ -383,12 +413,15 @@ def discriminator_step(
     traj_fake = torch.cat([obs_traj, pred_traj_fake], dim=0)
     traj_fake_rel = torch.cat([obs_traj_rel, pred_traj_fake_rel], dim=0)
 
-    scores_fake = discriminator(traj_fake, traj_fake_rel, seq_start_end)
-    scores_real = discriminator(traj_real, traj_real_rel, seq_start_end)
-
+    scores_fake, cls_score_fake = discriminator(traj_fake, traj_fake_rel, seq_start_end)
+    scores_real, cls_score_real = discriminator(traj_real, traj_real_rel, seq_start_end)
+    cls_loss = nn.CrossEntropyLoss()(cls_score_fake/0.01, idxes)
     # Compute loss with optional gradient penalty
-    data_loss = d_loss_fn(scores_real, scores_fake)
-    losses['D_data_loss'] = data_loss.item()
+    data_loss  = cls_loss
+    losses['D_cls_loss'] = data_loss.item()
+    d_loss_value =  d_loss_fn(scores_real, scores_fake)
+    data_loss += d_loss_value
+    losses['D_data_loss'] = d_loss_value.item()
     loss += data_loss
     losses['D_total_loss'] = loss.item()
 
@@ -403,7 +436,7 @@ def discriminator_step(
 
 
 def generator_step(
-    args, batch, generator, discriminator, g_loss_fn, optimizer_g, num_iter
+    args, batch, generator, discriminator, g_loss_fn, optimizer_g, iter
 ):
     batch = [tensor.cuda() for tensor in batch]
     (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped,
@@ -413,56 +446,98 @@ def generator_step(
     g_l2_loss_rel = []
 
     loss_mask = loss_mask[:, args.obs_len:]
+    traj_real = torch.cat([obs_traj, pred_traj_gt], dim=0)
+    traj_real_rel = torch.cat([obs_traj_rel, pred_traj_gt_rel], dim=0)
 
-    for _ in range(args.best_k):
-        generator_out = generator(obs_traj, obs_traj_rel, seq_start_end)
 
-        pred_traj_fake_rel = generator_out
-        pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1])
+    scores_real, cls_score = discriminator(traj_real, traj_real_rel, seq_start_end)
+    generator_out = generator(
+        obs_traj, obs_traj_rel, seq_start_end
+    )
+    if iter %4 == 0:
+        idxes = torch.argmax(cls_score, dim=-1)
+    else:
+        idxes = torch.randint(0, args.best_k, (generator_out.size(2),)).cuda()
+    # idx_onehot = F.one_hot(idxes, args.best_k)
+    pred_traj_fake_rel = generator_out.permute(2, 1, 0, 3)[torch.arange(generator_out.size(2)), idxes].permute(1, 0, 2)
+    # pred_traj_fake_rel = n_pred_traj_fake_rel[idx]
 
-        if args.l2_loss_weight > 0:
-            g_l2_loss_rel.append(args.l2_loss_weight * l2_loss(
-                pred_traj_fake_rel,
-                pred_traj_gt_rel,
-                loss_mask,
-                mode='raw'))
-
-    g_l2_loss_sum_rel = torch.zeros(1).to(pred_traj_gt)
     if args.l2_loss_weight > 0:
-        g_l2_loss_rel = torch.stack(g_l2_loss_rel, dim=1)
-        for start, end in seq_start_end.data:
-            _g_l2_loss_rel = g_l2_loss_rel[start:end]
-            _g_l2_loss_rel = torch.sum(_g_l2_loss_rel, dim=0)
-            if args.variety_loss_mode == "min":
-                _g_l2_loss_rel = torch.min(_g_l2_loss_rel) / torch.sum(
-                    loss_mask[start:end])
-            elif args.variety_loss_mode == "max":
-                _g_l2_loss_rel = torch.max(_g_l2_loss_rel) / torch.sum(
-                    loss_mask[start:end])
-            elif args.variety_loss_mode == "avg":
-                _g_l2_loss_rel = torch.mean(_g_l2_loss_rel) / torch.sum(
-                    loss_mask[start:end])
-            elif args.variety_loss_mode == "median":
-                _g_l2_loss_rel = torch.median(_g_l2_loss_rel) / torch.sum(
-                    loss_mask[start:end])
-            elif args.variety_loss_mode == "rand":
-                _g_l2_loss_rel = torch.min(torch.shuffle(_g_l2_loss_rel)) / torch.sum(
-                    loss_mask[start:end]) 
+        g_l2_loss_sum_rel = args.l2_loss_weight * l2_loss(
+            pred_traj_fake_rel,
+            pred_traj_gt_rel,
+            loss_mask,
+            mode='average')
+
+
+    # discriminator()
+
+
+    # for i in range(args.best_k):
+    #     pred_traj_fake_rel = generator_out[idx]
+    #     pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1])
+    #     if args.l2_loss_weight > 0:
+    #         g_l2_loss_rel.append(args.l2_loss_weight * l2_loss(
+    #             pred_traj_fake_rel,
+    #             pred_traj_gt_rel,
+    #             loss_mask,
+    #             mode='raw'))
+
+    # g_l2_loss_sum_rel = torch.zeros(1).to(pred_traj_gt)
+    # if args.l2_loss_weight > 0:
+    #     g_l2_loss_rel = torch.stack(g_l2_loss_rel, dim=1)
+    #     for start, end in seq_start_end.data:
+    #         _g_l2_loss_rel = g_l2_loss_rel[start:end]
+    #         _g_l2_loss_rel = torch.sum(_g_l2_loss_rel, dim=0)
+    #         if args.variety_loss_mode == "min":
+    #             _g_l2_loss_rel = torch.min(_g_l2_loss_rel) / torch.sum(
+    #                 loss_mask[start:end])
+    #         elif args.variety_loss_mode == "max":
+    #             _g_l2_loss_rel = torch.max(_g_l2_loss_rel) / torch.sum(
+    #                 loss_mask[start:end])
+    #         elif args.variety_loss_mode == "avg":
+    #             _g_l2_loss_rel = torch.mean(_g_l2_loss_rel) / torch.sum(
+    #                 loss_mask[start:end])
+    #         elif args.variety_loss_mode == "median":
+    #             _g_l2_loss_rel = torch.median(_g_l2_loss_rel) / torch.sum(
+    #                 loss_mask[start:end])
+    #         elif args.variety_loss_mode == "rand":
+    #             _g_l2_loss_rel = torch.min(torch.shuffle(_g_l2_loss_rel)) / torch.sum(
+    #                 loss_mask[start:end])
             
 
-            g_l2_loss_sum_rel += _g_l2_loss_rel
+            # g_l2_loss_sum_rel += _g_l2_loss_rel
+    if args.l2_loss_weight > 0:
         losses['G_l2_loss_rel'] = g_l2_loss_sum_rel.item()
         loss += g_l2_loss_sum_rel
+    idxes = torch.randint(0, args.best_k, (generator_out.size(2),)).cuda()
+    pred_traj_fake_rel = generator_out.flatten(1,2)
 
-    traj_fake = torch.cat([obs_traj, pred_traj_fake], dim=0)
-    traj_fake_rel = torch.cat([obs_traj_rel, pred_traj_fake_rel], dim=0)
-
-    scores_fake = discriminator(traj_fake, traj_fake_rel, seq_start_end)
+    # idx_onehot = F.one_hot(idxes, args.best_k)
+    # pred_traj_fake_rel = generator_out.permute(2, 1, 0, 3)[torch.arange(generator_out.size(2)), idxes].permute(1, 0, 2)
+    # idx_onehot = F.one_hot(idx, args.best_k).cuda()
+    pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1].repeat(
+        (20,1)
+    ))
+    traj_fake = torch.cat([obs_traj.repeat((1,20,1)), pred_traj_fake], dim=0)
+    traj_fake_rel = torch.cat([obs_traj_rel.repeat((1,20,1)), pred_traj_fake_rel], dim=0)
+    # discriminative loss
+    scores_fake, cls_score = discriminator(traj_fake, traj_fake_rel, seq_start_end)
     discriminator_loss = g_loss_fn(scores_fake)
-
     loss += discriminator_loss
-    losses['G_discriminator_loss'] = discriminator_loss.item()
+
+    losses['G_data_loss'] = discriminator_loss.item()
+    # idxes = torch.randint(0, args.best_k - 1, (generator_out.size(2),)).cuda()
+
+    #
+    # cls_score = cls_score.view(-1, args.best_k, args.best_k)[torch.arange(generator_out.size(2)), idxes]
+    cls_loss = nn.CrossEntropyLoss()(cls_score, torch.arange(args.best_k).cuda().repeat_interleave(
+        generator_out.size(2),dim=0
+    ))
+    losses['G_cls_loss'] = cls_loss.item()
+    loss += cls_loss
     losses['G_total_loss'] = loss.item()
+
 
     optimizer_g.zero_grad()
     loss.backward()
@@ -491,12 +566,22 @@ def check_accuracy(
             batch = [tensor.cuda() for tensor in batch]
             (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
              non_linear_ped, loss_mask, seq_start_end) = batch
+            traj_real = torch.cat([obs_traj, pred_traj_gt], dim=0)
+            traj_real_rel = torch.cat([obs_traj_rel, pred_traj_gt_rel], dim=0)
             linear_ped = 1 - non_linear_ped
             loss_mask = loss_mask[:, args.obs_len:]
-
-            pred_traj_fake_rel = generator(
+            scores_real,cls_score_real = discriminator(traj_real, traj_real_rel, seq_start_end)
+            generator_out = generator(
                 obs_traj, obs_traj_rel, seq_start_end
             )
+            idx = torch.argmax(cls_score_real, dim=1)
+
+
+
+            # idx_onehot = F.one_hot(idxes, args.best_k)
+            pred_traj_fake_rel = generator_out.permute(2, 1, 0, 3)[torch.arange(generator_out.size(2)), idx].permute(
+                1, 0, 2)
+            # pred_traj_fake_rel, pred_traj_fake = torch.gather(generator_out, 1, idx)
             pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1])
 
             g_l2_loss_abs, g_l2_loss_rel = cal_l2_losses(
@@ -511,13 +596,17 @@ def check_accuracy(
                 pred_traj_gt, pred_traj_fake, linear_ped, non_linear_ped
             )
 
-            traj_real = torch.cat([obs_traj, pred_traj_gt], dim=0)
-            traj_real_rel = torch.cat([obs_traj_rel, pred_traj_gt_rel], dim=0)
+            idxes = torch.randint(0, args.best_k - 1, (generator_out.size(2),)).cuda()
+
+            # idx_onehot = F.one_hot(idxes, args.best_k)
+            pred_traj_fake_rel = generator_out.permute(2, 1, 0, 3)[torch.arange(generator_out.size(2)), idxes].permute(
+                1, 0, 2)
+            pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1])
             traj_fake = torch.cat([obs_traj, pred_traj_fake], dim=0)
             traj_fake_rel = torch.cat([obs_traj_rel, pred_traj_fake_rel], dim=0)
 
-            scores_fake = discriminator(traj_fake, traj_fake_rel, seq_start_end)
-            scores_real = discriminator(traj_real, traj_real_rel, seq_start_end)
+            scores_fake, cls_score_fake = discriminator(traj_fake, traj_fake_rel, seq_start_end)
+
 
             d_loss = d_loss_fn(scores_real, scores_fake)
             d_losses.append(d_loss.item())
@@ -598,3 +687,4 @@ def cal_fde(
 if __name__ == '__main__':
     args = parser.parse_args()
     main(args)
+    writer.close()

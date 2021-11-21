@@ -15,10 +15,13 @@ from sgan.data.loader import data_loader
 from sgan.losses import gan_g_loss, gan_d_loss, l2_loss
 from sgan.losses import displacement_error, final_displacement_error
 
-from sgan.models import TrajectoryGenerator, TrajectoryDiscriminator
+from sgan.models import TrajectoryDiscriminator
+from sgan.models import CCTrajectoryGenerator as TrajectoryGenerator
 from sgan.utils import int_tuple, bool_flag, get_total_norm
 from sgan.utils import relative_to_abs, get_dset_path
-
+from torch.utils.tensorboard import SummaryWriter
+from evaluate_model import main as evaluate
+from attrdict import AttrDict
 torch.backends.cudnn.benchmark = True
 
 parser = argparse.ArgumentParser()
@@ -109,6 +112,11 @@ def get_dtypes(args):
 
 
 def main(args):
+    fh = logging.FileHandler(os.path.join(args.output_dir, "train.log"))
+    fh.setLevel("DEBUG")
+    logger.addHandler(fh)
+    
+    writer = SummaryWriter()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_num
     train_path = get_dset_path(args.dataset_name, 'train')
     val_path = get_dset_path(args.dataset_name, 'val')
@@ -171,11 +179,14 @@ def main(args):
     g_loss_fn = gan_g_loss
     d_loss_fn = gan_d_loss
 
+
     optimizer_g = optim.Adam(generator.parameters(), lr=args.g_learning_rate)
     optimizer_d = optim.Adam(
         discriminator.parameters(), lr=args.d_learning_rate
     )
 
+    # scheduler_g = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_g, args.num_epochs, last_epoch=-1)
+    # scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_d,args.num_epochs, last_epoch=-1)
     # Maybe restore from checkpoint
     restore_path = None
     if args.checkpoint_start_from is not None:
@@ -243,6 +254,7 @@ def main(args):
                 losses_d = discriminator_step(args, batch, generator,
                                               discriminator, d_loss_fn,
                                               optimizer_d)
+                writer.add_scalars("loss_adv", {'d_loss': losses_d['D_total_loss']},t)
                 checkpoint['norm_d'].append(
                     get_total_norm(discriminator.parameters()))
                 d_steps_left -= 1
@@ -251,6 +263,8 @@ def main(args):
                 losses_g = generator_step(args, batch, generator,
                                           discriminator, g_loss_fn,
                                           optimizer_g)
+                writer.add_scalar("G_l2_loss_rel", losses_g['G_l2_loss_rel'],t)
+                writer.add_scalars("loss_adv",{'g_loss': losses_g['G_discriminator_loss']},t)
                 checkpoint['norm_g'].append(
                     get_total_norm(generator.parameters())
                 )
@@ -380,7 +394,7 @@ def discriminator_step(
 
     scores_fake = discriminator(traj_fake, traj_fake_rel, seq_start_end)
     scores_real = discriminator(traj_real, traj_real_rel, seq_start_end)
-
+    
     # Compute loss with optional gradient penalty
     data_loss = d_loss_fn(scores_real, scores_fake)
     losses['D_data_loss'] = data_loss.item()
@@ -593,3 +607,8 @@ def cal_fde(
 if __name__ == '__main__':
     args = parser.parse_args()
     main(args)
+    eval_args = AttrDict()
+    eval_args.model_path = os.path.join(args.output_dir, "checkpoint_with_model.pt")
+    eval_args.num_samples = 20
+    eval_args.dset_type = "test"
+    evaluate(eval_args)

@@ -10,7 +10,7 @@ else
   OUTPUT_DIR=$PWD/checkpoints/${DATASET_NAME}/$RUN_NAME
 fi
 mkdir -p $OUTPUT_DIR
-python scripts/train.py \
+python3 scripts/train.py \
   --output_dir $OUTPUT_DIR \
   --encoder_h_dim_d 48 \
   --neighborhood_size 2.0 \
@@ -29,13 +29,13 @@ python scripts/train.py \
   --obs_len 8 \
   --skip 1 \
   --g_steps 1 \
-  --g_learning_rate 0.001 \
+  --g_learning_rate 0.0001 \
   --l2_loss_weight 1.0 \
   --grid_size 8 \
   --bottleneck_dim 8 \
   --checkpoint_name checkpoint \
   --gpu_num 0  \
-  --restore_from_checkpoint 1 \
+  --restore_from_checkpoint 0 \
   --dropout 0.0 \
   --checkpoint_every 300 \
   --noise_mix_type local \
@@ -55,4 +55,4 @@ python scripts/train.py \
   --noise_dim 8 \
   --pool_every_timestep 0 \
   --variety_loss_mode min
-python scripts/evaluate_model.py --model_path ${OUTPUT_DIR}/checkpoint_with_model.pt
+#python3 scripts/evaluate_model.py --model_path ${OUTPUT_DIR}/checkpoint_with_model.pt

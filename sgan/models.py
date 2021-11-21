@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-
-
+from torch.nn import Softmax
+import torch.nn.functional as F
 def make_mlp(dim_list, activation='relu', batch_norm=True, dropout=0):
     layers = []
     for dim_in, dim_out in zip(dim_list[:-1], dim_list[1:]):
@@ -24,13 +24,27 @@ def get_noise(shape, noise_type):
         return torch.rand(*shape).sub_(0.5).mul_(2.0).cuda()
     raise ValueError('Unrecognized noise type "%s"' % noise_type)
 
+def normalize_obs_traj(obs_traj,seq_start_end):
+        """
+        Code adapted from Spatial Temporal Graph Transformer
+
+        """
+        norm_obs_traj = torch.zeros_like(obs_traj)
+        for start,end in seq_start_end.data:
+            mean_x = torch.mean(obs_traj[:, start:end,0])
+            mean_y = torch.mean(obs_traj[:, start:end,1])
+            std_x = torch.std(obs_traj[:, start:end,0])
+            std_y = torch.std(obs_traj[:, start:end,1])
+            norm_obs_traj[:,start:end, 0] = (obs_traj[:, start: end, 0] - mean_x)/std_x
+            norm_obs_traj[:, start: end, 1] = (obs_traj[:, start: end, 1] -  mean_y)/std_y
+        return norm_obs_traj
 
 class Encoder(nn.Module):
     """Encoder is part of both TrajectoryGenerator and
     TrajectoryDiscriminator"""
     def __init__(
         self, embedding_dim=64, h_dim=64, mlp_dim=1024, num_layers=1,
-        dropout=0.0, return_all=False
+        dropout=0.0, last=True, in_dim = 2
     ):
         super(Encoder, self).__init__()
 
@@ -38,21 +52,23 @@ class Encoder(nn.Module):
         self.h_dim = h_dim
         self.embedding_dim = embedding_dim
         self.num_layers = num_layers
-
+        self.in_dim = in_dim
         self.encoder = nn.LSTM(
             embedding_dim, h_dim, num_layers, dropout=dropout
         )
 
-        self.spatial_embedding = nn.Linear(2, embedding_dim)
-        self.return_all=return_all
+        self.spatial_embedding = nn.Linear(in_dim, embedding_dim)
+        self.last = last
+
+
 
     def init_hidden(self, batch):
         return (
-            torch.zeros(self.num_layers, batch, self.h_dim).cuda(),
-            torch.zeros(self.num_layers, batch, self.h_dim).cuda()
+            torch.randn(self.num_layers, batch, self.h_dim).cuda(),
+            torch.randn(self.num_layers, batch, self.h_dim).cuda()
         )
 
-    def forward(self, obs_traj):
+    def forward(self, obs_traj_rel, obs_traj = None, seq_start_end = None):
         """
         Inputs:
         - obs_traj: Tensor of shape (obs_len, batch, 2)
@@ -60,15 +76,20 @@ class Encoder(nn.Module):
         - final_h: Tensor of shape (self.num_layers, batch, self.h_dim)
         """
         # Encode observed Trajectory
-        batch = obs_traj.size(1)
-        obs_traj_embedding = self.spatial_embedding(obs_traj.contiguous().view(-1, 2))
+        batch = obs_traj_rel.size(1)
+        if obs_traj is not None and seq_start_end is not None and self.in_dim ==4:
+            obs_traj = torch.cat([normalize_obs_traj(obs_traj, seq_start_end),obs_traj_rel],dim=-1 )
+        else:
+            obs_traj = obs_traj_rel
+        # print(obs_traj.size(), )
+        obs_traj_embedding = self.spatial_embedding(obs_traj.contiguous().view(-1, self.in_dim))
         obs_traj_embedding = obs_traj_embedding.view(
             -1, batch, self.embedding_dim
         )
         state_tuple = self.init_hidden(batch)
         output, state = self.encoder(obs_traj_embedding, state_tuple)
         final_h = state[0]
-        if self.return_all:
+        if not self.last:
             return output
         return final_h
 
@@ -354,6 +375,129 @@ class SocialPooling(nn.Module):
         return pool_h
 
 
+def INF(B, H, W):
+    return -torch.diag(torch.tensor(float("inf")).cuda().repeat(H), 0).unsqueeze(0).repeat(B * W, 1, 1)
+
+
+class CrissCrossAttention(nn.Module):
+    """ Criss-Cross Attention Module"""
+
+    def __init__(self, in_dim):
+        super(CrissCrossAttention, self).__init__()
+        self.query_conv = nn.Conv2d(in_channels=in_dim, out_channels=in_dim // 8, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels=in_dim, out_channels=in_dim // 8, kernel_size=1)
+        self.value_conv = nn.Conv2d(in_channels=in_dim, out_channels=in_dim, kernel_size=1)
+        self.softmax = Softmax(dim=3)
+        self.INF = INF
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x, debug =False):
+        m_batchsize, _, height, width = x.size()
+
+        # x -> conv1x1(in_dim, in_dim //8)
+        #   height => seq_len ; width => agents
+        #   proj_query_H => (agents, seq_len,feat) => proj_query_W => (seq_len, agents,feat)
+        proj_query = self.query_conv(x)
+        proj_query_H = proj_query.permute(0, 3, 1, 2).contiguous().view(m_batchsize * width, -1, height).permute(0, 2,1)
+        proj_query_W = proj_query.permute(0, 2, 1, 3).contiguous().view(m_batchsize * height, -1, width).permute(0, 2,1)
+
+        #   proj_key_H => (agents, feat, seq_len) => proj_query_W => (seq_len, feat, agents)
+        proj_key = self.key_conv(x)
+        proj_key_H = proj_key.permute(0, 3, 1, 2).contiguous().view(m_batchsize * width, -1, height)
+        proj_key_W = proj_key.permute(0, 2, 1, 3).contiguous().view(m_batchsize * height, -1, width)
+
+        #   proj_value_H => (agents, feat, seq_len) => proj_value_W => (seq_len,feat, agents)
+        proj_value = self.value_conv(x)
+        proj_value_H = proj_value.permute(0, 3, 1, 2).contiguous().view(m_batchsize * width, -1, height)
+        proj_value_W = proj_value.permute(0, 2, 1, 3).contiguous().view(m_batchsize * height, -1, width)
+
+        # key and queue features bmm on H => agents, seq_len, seq_len => 1, agents, seq_len, seq_len => 1, seq_len, agents, seq_len
+        energy_H = (torch.bmm(proj_query_H, proj_key_H) + self.INF(m_batchsize, height, width)).view(m_batchsize, width,
+                                                                                                     height,
+                                                                                                     height).permute(0,2,1,3)
+        # key and queue features bmm on W => 1, seq_len, agents, agents
+        energy_W = torch.bmm(proj_query_W, proj_key_W).view(m_batchsize, height, width, width)
+
+
+        # concate = self.softmax(torch.cat([energy_H, energy_W], 3))
+        att_H = self.softmax(energy_H).permute(0, 2, 1, 3).contiguous().view(m_batchsize * width, height, height)
+        att_W = self.softmax(energy_W).permute(0, 2, 1, 3).contiguous().view(m_batchsize * height, width, width)
+        # att_H = concate[:, :, :, 0:height].permute(0, 2, 1, 3).contiguous().view(m_batchsize * width, height, height)
+        # print(concate)
+        # att_W = concate[:, :, :, height:height + width].contiguous().view(m_batchsize * height, width, width)
+        out_H = torch.bmm(proj_value_H, att_H.permute(0, 2, 1)).view(m_batchsize, width, -1, height).permute(0, 2, 3, 1)
+        out_W = torch.bmm(proj_value_W, att_W.permute(0, 2, 1)).view(m_batchsize, height, -1, width).permute(0, 2, 1, 3)
+        # print(out_H.size(),out_W.size())
+        # return self.gamma * out_W + x
+        if debug:
+            return self.gamma * (out_H + out_W) + x, att_W,att_H
+        else:
+            return self.gamma * (out_H + out_W) + x
+
+class RCCA(nn.Module):
+    def __init__(self, in_dim, n_recurrence = 2):
+        super().__init__()
+        self.cca = CrissCrossAttention(in_dim)
+        self.n_rec= n_recurrence
+        self.dropout = nn.Dropout(0.1)
+        self.encoder = Encoder(embedding_dim=16, h_dim=in_dim,last=False)
+        self.pre_attn_mlp = nn.Sequential(
+            nn.Linear(in_dim +in_dim, in_dim),
+            nn.ReLU()
+        )
+        self.post_attn_mlp = nn.Sequential(
+            nn.Linear(in_dim, in_dim),
+            nn.ReLU(),
+            # nn.Dropout(0.1)
+        )
+
+    def forward(self, hiddens,obs_traj = None, seq_start_end = None):
+
+        """
+        hiddens: (seq_len, batch_size, h_dim)
+        obs_traj: (seq_len, batch_size, 2)
+        """
+        abs_embedding = self.encoder(normalize_obs_traj(obs_traj, seq_start_end))
+        attn_in = self.pre_attn_mlp(torch.cat([hiddens,abs_embedding ],dim = -1))
+        scenes = attn_in
+        scenes = []
+        for start, end in seq_start_end.data:
+            output = attn_in[:, start:end, :].permute(2, 0, 1)
+            for i in range(self.n_rec):
+                output = self.cca(
+                    output.unsqueeze(0)
+                ).squeeze(0)
+            scenes.append(output.permute(1, 2, 0))
+
+        return self.post_attn_mlp(
+            torch.cat(scenes, dim=1)
+        ) + hiddens
+
+    def predict(self, hiddens,obs_traj = None, seq_start_end = None):
+        with torch.no_grad():
+            abs_embedding = self.encoder(normalize_obs_traj(obs_traj, seq_start_end))
+            attn_in = self.pre_attn_mlp(torch.cat([hiddens, abs_embedding], dim=-1))
+            scenes = []
+            atts_W = []
+            atts_H = []
+            for start, end in seq_start_end.data:
+                output = attn_in[:, start:end, :].permute(2, 0, 1)
+                for i in range(self.n_rec):
+                    output, att_W, att_H = self.cca(
+                        output.unsqueeze(0), debug=True
+                    )
+                    output = output.squeeze(0)
+                scenes.append(output.permute(1, 2, 0))
+                atts_H.append(att_H)
+                atts_W.append(att_W)
+
+            return self.post_attn_mlp(
+                torch.cat(scenes, dim=1)
+            ), atts_H, atts_W
+        # return attn_in
+        # return hiddens
+        # return torch.cat(scenes, dim=1)
+
 class TrajectoryGenerator(nn.Module):
     def __init__(
         self, obs_len, pred_len, embedding_dim=64, encoder_h_dim=64,
@@ -486,6 +630,7 @@ class TrajectoryGenerator(nn.Module):
 
         return decoder_h
 
+
     def mlp_decoder_needed(self):
         if (
             self.noise_dim or self.pooling_type or
@@ -508,7 +653,9 @@ class TrajectoryGenerator(nn.Module):
         """
         batch = obs_traj_rel.size(1)
         # Encode seq
-        final_encoder_h = self.encoder(obs_traj_rel)
+        final_encoder_h = self.encoder(
+            obs_traj_rel
+        )
         # Pool States
         if self.pooling_type:
             end_pos = obs_traj[-1, :, :]
@@ -613,13 +760,202 @@ class TrajectoryDiscriminator(nn.Module):
         scores = self.real_classifier(classifier_input)
         return scores
 
-class PatchedTrajectoryDiscriminator(nn.Module):
+class CCTrajectoryGenerator(nn.Module):
+    def __init__(
+        self, obs_len, pred_len, embedding_dim=64, encoder_h_dim=64,
+        decoder_h_dim=128, mlp_dim=1024, num_layers=1, noise_dim=(0, ),
+        noise_type='gaussian', noise_mix_type='ped', pooling_type=None,
+        pool_every_timestep=True, dropout=0.0, bottleneck_dim=1024,
+        activation='relu', batch_norm=True, neighborhood_size=2.0, grid_size=8
+    ):
+        super(CCTrajectoryGenerator, self).__init__()
+
+        if pooling_type and pooling_type.lower() == 'none':
+            pooling_type = None
+
+        self.obs_len = obs_len
+        self.pred_len = pred_len
+        self.mlp_dim = mlp_dim
+        self.encoder_h_dim = encoder_h_dim
+        self.decoder_h_dim = decoder_h_dim
+        self.embedding_dim = embedding_dim
+        self.noise_dim = noise_dim
+        self.num_layers = num_layers
+        self.noise_type = noise_type
+        self.noise_mix_type = noise_mix_type
+        self.pooling_type = pooling_type
+        self.noise_first_dim = 0
+        self.pool_every_timestep = pool_every_timestep
+        self.bottleneck_dim = 1024
+
+        self.encoder = Encoder(
+            embedding_dim=embedding_dim,
+            h_dim=encoder_h_dim,
+            mlp_dim=mlp_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            last = False,
+            in_dim=2
+        )
+
+        self.decoder = Decoder(
+            pred_len,
+            embedding_dim=embedding_dim,
+            h_dim=decoder_h_dim,
+            mlp_dim=mlp_dim,
+            num_layers=num_layers,
+            pool_every_timestep=pool_every_timestep,
+            dropout=dropout,
+            bottleneck_dim=bottleneck_dim,
+            activation=activation,
+            batch_norm=batch_norm,
+            pooling_type=pooling_type,
+            grid_size=grid_size,
+            neighborhood_size=neighborhood_size
+        )
+
+
+
+        if self.noise_dim[0] == 0:
+            self.noise_dim = None
+        else:
+            self.noise_first_dim = noise_dim[0]
+
+        # Decoder Hidden
+        if pooling_type:
+            input_dim = encoder_h_dim + bottleneck_dim
+        else:
+            input_dim = encoder_h_dim
+
+        if self.mlp_decoder_needed():
+            mlp_decoder_context_dims = [
+                input_dim, mlp_dim, decoder_h_dim - self.noise_first_dim
+            ]
+
+            self.mlp_decoder_context = make_mlp(
+                mlp_decoder_context_dims,
+                activation=activation,
+                batch_norm=batch_norm,
+                dropout=dropout
+            )
+        self.rcca = RCCA(self.encoder_h_dim)
+
+
+    def add_noise(self, _input, seq_start_end, user_noise=None):
+        """
+        Inputs:
+        - _input: Tensor of shape (_, decoder_h_dim - noise_first_dim)
+        - seq_start_end: A list of tuples which delimit sequences within batch.
+        - user_noise: Generally used for inference when you want to see
+        relation between different types of noise and outputs.
+        Outputs:
+        - decoder_h: Tensor of shape (_, decoder_h_dim)
+        """
+        if not self.noise_dim:
+            return _input
+
+        if self.noise_mix_type == 'global':
+            noise_shape = (seq_start_end.size(0),) + self.noise_dim
+        else:
+            noise_shape = (_input.size(0),) + self.noise_dim
+
+        if user_noise is not None:
+            z_decoder = user_noise
+        else:
+            z_decoder = get_noise(noise_shape, self.noise_type)
+
+        if self.noise_mix_type == 'global':
+            _list = []
+            for idx, (start, end) in enumerate(seq_start_end):
+                start = start.item()
+                end = end.item()
+                _vec = z_decoder[idx].view(1, -1)
+                _to_cat = _vec.repeat(end - start, 1)
+                _list.append(torch.cat([_input[start:end], _to_cat], dim=1))
+            decoder_h = torch.cat(_list, dim=0)
+            return decoder_h
+
+        decoder_h = torch.cat([_input, z_decoder], dim=1)
+
+        return decoder_h
+
+    def mlp_decoder_needed(self):
+        if (
+                self.noise_dim or self.pooling_type or
+                self.encoder_h_dim != self.decoder_h_dim
+        ):
+            return True
+        else:
+            return False
+
+    def forward(self, obs_traj, obs_traj_rel, seq_start_end, user_noise=None):
+        """
+        Inputs:
+        - obs_traj: Tensor of shape (obs_len, batch, 2)
+        - obs_traj_rel: Tensor of shape (obs_len, batch, 2)
+        - seq_start_end: A list of tuples which delimit sequences within batch.
+        - user_noise: Generally used for inference when you want to see
+        relation between different types of noise and outputs.
+        Output:
+        - pred_traj_rel: Tensor of shape (self.pred_len, batch, 2)
+        """
+        batch = obs_traj_rel.size(1)
+
+        # Encode seq
+        outputs = self.encoder(obs_traj_rel, obs_traj,seq_start_end) # (seq_len, batch_size, h_dim)
+        # outputs = outputs.permute(2, 0, 1 ) # (h_dim,seq_len, batch_size)
+        scenes = self.rcca(outputs,obs_traj,  seq_start_end)
+
+        # final_encoder_h = outputs[-1]
+        final_encoder_h = scenes[-1]
+        # final_encoder_h.unsqueeze(0)
+        # Pool States
+        # if self.pooling_type:
+        #     end_pos = obs_traj[-1, :, :]
+        #     pool_h = self.pool_net(final_encoder_h, seq_start_end, end_pos)
+        #     # Construct input hidden states for decoder
+        #     mlp_decoder_context_input = torch.cat(
+        #         [final_encoder_h.view(-1, self.encoder_h_dim), pool_h], dim=1)
+        # else:
+        #     mlp_decoder_context_input = final_encoder_h.view(
+        #         -1, self.encoder_h_dim)
+        mlp_decoder_context_input = final_encoder_h.view(-1, self.encoder_h_dim)
+        # Add Noise
+        if self.mlp_decoder_needed():
+            noise_input = self.mlp_decoder_context(mlp_decoder_context_input)
+        else:
+            noise_input = mlp_decoder_context_input
+
+        decoder_h = self.add_noise(
+            noise_input, seq_start_end, user_noise=user_noise)
+        decoder_h = torch.unsqueeze(decoder_h, 0)
+
+        decoder_c = torch.zeros(
+            self.num_layers, batch, self.decoder_h_dim
+        ).cuda()
+
+        state_tuple = (decoder_h, decoder_c)
+        last_pos = obs_traj[-1]
+        last_pos_rel = obs_traj_rel[-1]
+        # Predict Trajectory
+
+        decoder_out = self.decoder(
+            last_pos,
+            last_pos_rel,
+            state_tuple,
+            seq_start_end,
+        )
+        pred_traj_fake_rel, final_decoder_h = decoder_out
+
+        return pred_traj_fake_rel
+
+class PatchTrajectoryDiscriminator(nn.Module):
     def __init__(
         self, obs_len, pred_len, embedding_dim=64, h_dim=64, mlp_dim=1024,
         num_layers=1, activation='relu', batch_norm=True, dropout=0.0,
         d_type='local'
     ):
-        super(PatchedTrajectoryDiscriminator, self).__init__()
+        super(PatchTrajectoryDiscriminator, self).__init__()
 
         self.obs_len = obs_len
         self.pred_len = pred_len
@@ -634,7 +970,7 @@ class PatchedTrajectoryDiscriminator(nn.Module):
             mlp_dim=mlp_dim,
             num_layers=num_layers,
             dropout=dropout,
-            return_all=True
+            last=False
         )
 
         real_classifier_dims = [h_dim, mlp_dim, 1]
@@ -669,16 +1005,40 @@ class PatchedTrajectoryDiscriminator(nn.Module):
         # end_pos. The intution being that hidden state has the whole
         # trajectory and relative postion at the start when combined with
         # trajectory information should help in discriminative behavior.
-
-        if self.d_type == 'local':
-            classifier_input = outputs.squeeze()
-        else:
-            classifier_inputs = []
-            for output in outputs:
+        scores = []
+        for final_h in outputs:
+            if self.d_type == 'local':
+                classifier_input = final_h.squeeze()
+            else:
                 classifier_input = self.pool_net(
-                    output.squeeze(), seq_start_end, traj[0]
+                    final_h.squeeze(), seq_start_end, traj[0]
                 )
-            classifier_inputs.append(output)
-            classifier_input = torch.stack(classifier_inputs)
-        scores = self.real_classifier(classifier_input)
-        return scores[-self.pred_len:]
+            score = self.real_classifier(classifier_input)
+            scores.append(score)
+        return torch.cat(scores)
+
+
+
+class CollisionCritic(nn.Module):
+    def __init__(self):
+        self.encoder =Encoder(embedding_dim = 16, h_dim=64)
+
+
+
+    def forward(self, traj_rel, traj, seq_start_end):
+        """
+        traj_rel,traj: (seq_len, batch_size,2)
+
+        """
+
+        seq_len =  traj_rel.size(0)
+        for start, end in seq_start_end.data:
+            traj_rel_matrix = traj[:,start:end].unsqueeze(2) - traj[:,start:end].unsqueeze(1) #(seq_len, batch_size,batch_size, 2)
+            embedded_traj_rel_matrix = self.encoder(traj_rel_matrix.view(seq_len, -1, 2))
+
+
+
+
+
+
+
